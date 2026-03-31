@@ -11,7 +11,7 @@ from augment import (simple_augment, intensity_augment, noise_augment,
                      gamma_augment, invert_augment, cutout_augment,
                      salt_pepper_augment, intensity_scale_shift)
 
-with open('parameter_small_blob_1.json') as f:
+with open('param_template.json') as f:
     params = json.load(f)
 
 N = 20   # repetitions per step
