@@ -1,4 +1,5 @@
-# Synaptic Partner Detection — ogogog
+# Synaptic Partner Detection - rewrite of [Synful](https://github.com/funkelab/synful)
+This is a (mostly) TensorFlow implementation of the dual-headed UNET architecture from Synful. Complete with model architecture, augmentations, and pulling from data. This is so far only tested with zarr files. 
 
 Training, prediction, and extraction pipeline for synapse detection and partner vector prediction.
 
@@ -7,8 +8,8 @@ Training, prediction, and extraction pipeline for synapse detection and partner 
 Requires CUDA 12.4 and conda.
 
 ```bash
-conda create -n synful python=3.10 -y
-conda activate synful
+conda create -n synpred python=3.10 -y
+conda activate synpred
 ```
 
 ### PyTorch (CUDA 12.4)
@@ -42,54 +43,31 @@ pip install \
     daisy==1.0
 ```
 
-### Connectomics / CATMAID
-
-```bash
-pip install \
-    python-catmaid==2.4.2 \
-    navis==1.5.0 \
-    caveclient==5.17.4
-```
-
-### SegToPCG (for match_to_roots)
-
-Clone and install from source — not on PyPI:
-
-```bash
-git clone https://github.com/seung-lab/SegToPCG /path/to/SegToPCG
-pip install -e /path/to/SegToPCG
-```
-
-Update `match_to_roots/` imports to point to your local clone if needed.
-
 ## Pipeline
 
 ```
-predict.py → extract_daisy.py → match_to_roots/get_roots_synapses.py
-```
-
-Or use the shell script:
-
-```bash
-bash run_pipeline.sh parameter.json
+predict.py → extract_daisy.py 
 ```
 
 ## Key files
 
 | File | Purpose |
 |---|---|
-| `train.py` | Training loop |
 | `dataset.py` | Data loading + GT rendering |
 | `model.py` | U-Net architecture |
+| `train.py` | Training loop |
 | `predict.py` | Blockwise inference over zarr |
-| `extract_daisy.py` | Daisy-based chunked synapse extraction |
-| `extract.py` | Single-machine extraction (small volumes) |
-| `match_to_roots/get_roots_synapses.py` | Map synapses to neuron IDs via CAVE/CATMAID |
-| `view_snap.ipynb` | Snapshot viewer for training QC |
-| `view_out.ipynb` | Output viewer for predicted synapses |
-| `parameter_small_blob_3.json` | Current best parameter file |
+| `extract_daisy.py` | Daisy-based chunked synapse extraction (faster and with daisy) |
+| `extract.py` | Single-machine extraction (small volumes, slower but no daisy requirement) |
+
+## Testing files
+
+| File | Purpose |
+|---|---|
+| `view_snap.ipynb` | Viewer for snapshots produced during training|
+| `pred_view.ipynb` | Output viewer for predicted volumes |
+| `profiling.py` | Profiler, runs a single test with paramter file defined in it, to check for speed and compiling on GPU |
 
 ## Parameter files
 
-- `parameter.json` — megalopta PB2 full prediction
-- `parameter_small_blob_1/2/3.json` — training experiments (3 is current)
+- `param_template.json` — Parameter input JSON
