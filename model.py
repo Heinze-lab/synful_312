@@ -21,32 +21,42 @@ from typing import List, Tuple
 # ---------------------------------------------------------------------------
 
 def _make_norm(num_channels: int, norm_type: str = "group", target_groups: int = 4) -> nn.Module:
-    """BatchNorm3d or GroupNorm (up to target_groups, falling back to largest valid divisor)."""
+    """InstanceNorm3d (default), BatchNorm3d, or GroupNorm."""
     if norm_type == "batch":
         return nn.BatchNorm3d(num_channels)
+    if norm_type == "instance":
+        return nn.InstanceNorm3d(num_channels, affine=True)
+    # "group" — kept for back-compat, but instance is preferred at batch_size=1
     g = target_groups
     while g > 1 and num_channels % g != 0:
         g -= 1
-    return nn.GroupNorm(g, num_channels)
+    return nn.GroupNorm(g, num_channels, eps=1e-3)
 
 
 class ConvBlock(nn.Module):
-    """Two conv→Norm→ReLU layers (same-padding so spatial dims are preserved)."""
+    """Two conv→Norm→ReLU layers (same-padding so spatial dims are preserved).
+
+    Norm layers run in float32 to prevent inf/NaN when Conv3d overflows in float16 under AMP.
+    """
 
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, norm_type: str = "group"):
         super().__init__()
         pad = kernel_size // 2
-        self.block = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, kernel_size, padding=pad, bias=False),
-            _make_norm(out_ch, norm_type),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(out_ch, out_ch, kernel_size, padding=pad, bias=False),
-            _make_norm(out_ch, norm_type),
-            nn.ReLU(inplace=True),
-        )
+        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size, padding=pad, bias=False)
+        self.norm1 = _make_norm(out_ch, norm_type)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size, padding=pad, bias=False)
+        self.norm2 = _make_norm(out_ch, norm_type)
+        self.relu2 = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+        x = self.conv1(x)
+        x = self.norm1(x.float()).to(x.dtype)
+        x = self.relu1(x)
+        x = self.conv2(x)
+        x = self.norm2(x.float()).to(x.dtype)
+        x = self.relu2(x)
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -78,30 +88,27 @@ class UNetEncoder(nn.Module):
             int(fmap_num * (fmap_inc_factor ** i)) for i in range(n_levels)
         ]
 
-        self.conv_blocks = nn.ModuleList()
-        self.pools = nn.ModuleList()
-
         in_ch = in_channels
         for i in range(n_levels):
-            self.conv_blocks.append(ConvBlock(in_ch, self.fmaps[i], kernel_size, norm_type))
+            setattr(self, f"conv_{i}", ConvBlock(in_ch, self.fmaps[i], kernel_size, norm_type))
             in_ch = self.fmaps[i]
             if i < len(downsample_factors):
                 ds = [int(d) for d in downsample_factors[i]]
-                self.pools.append(
-                    nn.MaxPool3d(kernel_size=ds, stride=ds)
-                )
+                setattr(self, f"pool_{i}", nn.MaxPool3d(kernel_size=ds, stride=ds))
+        self._n_levels = n_levels
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Returns (bottleneck_features, [skip_0, skip_1, …]) fine→coarse."""
         skips: List[torch.Tensor] = []
-        for i, conv in enumerate(self.conv_blocks):
+        for i in range(self._n_levels):
+            conv = getattr(self, f"conv_{i}")
             if self.use_checkpoint:
                 x = checkpoint(conv, x, use_reentrant=False)
             else:
                 x = conv(x)
-            if i < len(self.pools):
+            if i < self._n_levels - 1:
                 skips.append(x)
-                x = self.pools[i](x)
+                x = getattr(self, f"pool_{i}")(x)
         return x, skips
 
 
@@ -126,8 +133,7 @@ class UNetDecoder(nn.Module):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         n_levels = len(downsample_factors)
-        self.upsamples = nn.ModuleList()
-        self.conv_blocks = nn.ModuleList()
+        self._n_levels = n_levels
 
         # iterate from bottleneck → finest resolution
         for i in range(n_levels):
@@ -137,22 +143,17 @@ class UNetDecoder(nn.Module):
             out_ch = fmaps[level]
             ds = [int(d) for d in downsample_factors[level]]
 
-            self.upsamples.append(
-                nn.ConvTranspose3d(in_ch, in_ch, kernel_size=ds, stride=ds)
-            )
-            self.conv_blocks.append(
-                ConvBlock(in_ch + skip_ch, out_ch, kernel_size, norm_type)
-            )
+            setattr(self, f"up_{i}",   nn.ConvTranspose3d(in_ch, in_ch, kernel_size=ds, stride=ds))
+            setattr(self, f"conv_{i}", ConvBlock(in_ch + skip_ch, out_ch, kernel_size, norm_type))
 
     def forward(
         self, x: torch.Tensor, skips: List[torch.Tensor]
     ) -> torch.Tensor:
-        for up, conv, skip in zip(
-            self.upsamples, self.conv_blocks, reversed(skips)
-        ):
-            x = up(x)
+        for i, skip in enumerate(reversed(skips)):
+            x = getattr(self, f"up_{i}")(x)
             skip = self._center_crop(skip, x)
             x = torch.cat([x, skip], dim=1)
+            conv = getattr(self, f"conv_{i}")
             if self.use_checkpoint:
                 x = checkpoint(conv, x, use_reentrant=False)
             else:

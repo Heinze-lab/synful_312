@@ -31,7 +31,6 @@ import torch.nn.functional as F
 from scipy.ndimage import map_coordinates, gaussian_filter
 
 
-
 # ---------------------------------------------------------------------------
 # 1. SimpleAugment  (mirror_only=[1,2], transpose_only=[1,2])
 # ---------------------------------------------------------------------------
@@ -214,6 +213,8 @@ def _build_rotation_field(shape, angle):
 
 
 def _jacobian_of_field(disp):
+    """Compute the full Jacobian J of the deformation field (identity + disp).
+    Used to rotate direction vectors consistently with the spatial warp."""
     J = np.zeros((3, 3) + disp.shape[1:], dtype=np.float32)
     for i in range(3):
         for j in range(3):
@@ -223,6 +224,7 @@ def _jacobian_of_field(disp):
 
 
 def _transform_vectors_with_jacobian(vec_w, J):
+    """Apply Jacobian J to each voxel's direction vector."""
     return np.einsum("ijzyx,jzyx->izyx", J, vec_w).astype(np.float32)
 
 
@@ -622,7 +624,9 @@ def augment_sample(
 
     # 5. ElasticAugment — smooth deformation (uses real context if provided)
     # Pass context="defer" to skip here and apply GPU elastic in the training loop instead.
-    if context != "defer" and enabled("elastic", default=True):
+    # Do NOT gate via enabled() here — elastic has its own prob_elastic inside, and
+    # using apply_prob on top would double-gate and suppress it more than intended.
+    if context != "defer" and aug.get("elastic", {}).get("enabled", True):
         cfg = aug.get("elastic", {})
         raw, indicator, vectors, d_weight = elastic_augment(
             raw, indicator, vectors, d_weight,

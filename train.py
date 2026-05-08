@@ -11,8 +11,10 @@ import json
 import math
 import os
 import sys
+import time
+from pathlib import Path
 
-# Reduce CUDA allocator fragmentation — must be set before any CUDA allocation
+# Reduce CUDA allocator fragmentation — must be set before any CUDA allocation.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import h5py
@@ -23,7 +25,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-# Performance flags — matches train_gb.py
+# Allow TF32 on Ampere+ GPUs — faster matmuls with negligible precision loss.
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 
@@ -45,7 +47,18 @@ def center_crop(t: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     return t
 
 
-def mask_loss(pred, target, gamma=2.0, pos_weight=None, balance=False, balance_scale=1.0):
+def crop_pred_and_target(pred, target, output_size):
+    """Crop both pred and target to output_size from their centers (synful-style supervision)."""
+    for dim, sz in enumerate(output_size):
+        diff_p = pred.shape[dim + 2] - sz
+        diff_t = target.shape[dim + 2] - sz
+        pred   = pred.narrow(dim + 2, diff_p // 2, sz)
+        target = target.narrow(dim + 2, diff_t // 2, sz)
+    return pred, target
+
+
+def mask_loss(pred, target, gamma=2.0, pos_weight=None, balance=False, balance_scale=1.0,
+              output_size=None):
     """Sigmoid focal loss with optional per-crop BalanceLabels-style weighting.
 
     balance=False (default): use fixed scalar pos_weight (original behaviour).
@@ -55,8 +68,14 @@ def mask_loss(pred, target, gamma=2.0, pos_weight=None, balance=False, balance_s
         balance_scale=1.0 → equal gradient contribution from pos and neg voxels
         balance_scale>1.0 → bias toward recall (more penalty on false negatives)
         balance_scale<1.0 → bias toward precision
+    output_size: if given, crop both pred and target to this size (synful-style);
+                 otherwise crop target to pred's shape (default, full-output supervision).
     """
-    target = center_crop(target, pred.shape)
+    if output_size is not None:
+        pred, target = crop_pred_and_target(pred, target, output_size)
+    else:
+        target = center_crop(target, pred.shape)
+    pred = pred.clamp(-15.0, 15.0)
 
     if balance:
         # compute weights in float32 to avoid float16 overflow under AMP
@@ -68,8 +87,13 @@ def mask_loss(pred, target, gamma=2.0, pos_weight=None, balance=False, balance_s
         if n_pos < 1.0:
             weight = torch.ones_like(target)
         else:
-            w_pos = float(min((n_total / (2.0 * n_pos)) * balance_scale, 100.0))
-            w_neg = float(min( n_total / (2.0 * max(n_neg, 1.0)),        100.0))
+            # Clip weights to match synful's BalanceLabels clipmin/clipmax=[7e-4, 0.9993].
+            # Converting frequency clips to weight clips: w = total/(2*freq),
+            # so freq_min=7e-4 → w_max = 1/(2*7e-4) ≈ 714, freq_max=0.9993 → w_min ≈ 0.5.
+            w_max = 1.0 / (2.0 * 7e-4)    # ≈ 714  (matches synful clipmin)
+            w_min = 1.0 / (2.0 * 0.9993)  # ≈ 0.50 (matches synful clipmax)
+            w_pos = float(np.clip((n_total / (2.0 * n_pos)) * balance_scale, w_min, w_max))
+            w_neg = float(np.clip( n_total / (2.0 * max(n_neg, 1.0)),        w_min, w_max))
             weight = target_f32 * w_pos + (1.0 - target_f32) * w_neg
         ce = nn.functional.binary_cross_entropy_with_logits(
             pred, target, weight=weight, reduction='none'
@@ -85,11 +109,16 @@ def mask_loss(pred, target, gamma=2.0, pos_weight=None, balance=False, balance_s
     return (((1.0 - p_t) ** gamma) * ce).mean()
 
 
-def direction_loss(pred, target, weight_mask, channel_weights=None, normalize_by_magnitude=False):
+def direction_loss(pred, target, weight_mask, channel_weights=None, normalize_by_magnitude=False,
+                   output_size=None):
     """MSE restricted to synapse blobs — computed in float32 to avoid float16 overflow."""
-    pred        = pred.float()
-    target      = center_crop(target, pred.shape).float()
-    weight_mask = center_crop(weight_mask, pred.shape).float()
+    pred = pred.float()
+    if output_size is not None:
+        pred, target = crop_pred_and_target(pred, target.float(), output_size)
+        weight_mask  = center_crop(weight_mask.float(), pred.shape)
+    else:
+        target      = center_crop(target, pred.shape).float()
+        weight_mask = center_crop(weight_mask, pred.shape).float()
     diff2 = (pred - target).pow(2) * weight_mask
     if channel_weights is not None:
         diff2 = diff2 * channel_weights.float().view(1, -1, 1, 1, 1)
@@ -103,9 +132,11 @@ def direction_loss(pred, target, weight_mask, channel_weights=None, normalize_by
 def combined_loss(pred_mask, pred_vec, t_mask, t_vec, d_weight,
                   m_scale, d_scale, comb_type, focal_gamma, channel_weights=None,
                   normalize_by_magnitude=False, pos_weight=None,
-                  balance=False, balance_scale=1.0):
-    m_loss = mask_loss(pred_mask.float(), t_mask.float(), focal_gamma, pos_weight, balance, balance_scale)
-    d_loss = direction_loss(pred_vec, t_vec, d_weight, channel_weights, normalize_by_magnitude)
+                  balance=False, balance_scale=1.0, output_size=None):
+    m_loss = mask_loss(pred_mask.float(), t_mask.float(), focal_gamma, pos_weight, balance, balance_scale,
+                       output_size=output_size)
+    d_loss = direction_loss(pred_vec, t_vec, d_weight, channel_weights, normalize_by_magnitude,
+                            output_size=output_size)
     if comb_type == "sum":
         total = m_scale * m_loss + d_scale * d_loss
     elif comb_type == "mean":
@@ -139,7 +170,6 @@ def save_checkpoint(model, optimizer, scaler, scheduler, iteration, directory, m
 def load_latest_checkpoint(model, optimizer, scaler, scheduler, directory, model_name):
     if not os.path.isdir(directory):
         return 0
-    from pathlib import Path
     ckpts = list(Path(directory).glob(f"{model_name}_checkpoint_*.pt"))
     if not ckpts:
         return 0
@@ -147,18 +177,40 @@ def load_latest_checkpoint(model, optimizer, scaler, scheduler, directory, model
     print(f"[train] Resuming from {latest}")
     state = torch.load(latest, map_location="cpu")
     sd    = state["model_state_dict"]
-    if any(k.startswith("_orig_mod.") for k in sd):
+
+    # torch.compile wraps parameters under an "_orig_mod." prefix.
+    # Strip it when loading into a fresh (uncompiled) model, or add it back
+    # if the current model is compiled but the checkpoint was saved uncompiled.
+    has_prefix  = any(k.startswith("_orig_mod.") for k in sd)
+    model_compiled = any(k.startswith("_orig_mod.") for k in model.state_dict())
+    if has_prefix and not model_compiled:
         sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-    # load into uncompiled model (strips _orig_mod prefix above), then compiled wrapper accepts it
-    try:
-        model.load_state_dict(sd)
-    except RuntimeError:
-        # checkpoint saved from compiled model, loading into uncompiled — add prefix
+    elif not has_prefix and model_compiled:
         sd = {"_orig_mod." + k: v for k, v in sd.items()}
-        model.load_state_dict(sd)
-    optimizer.load_state_dict(state["optimizer_state_dict"])
-    if "scaler_state_dict" in state:
-        scaler.load_state_dict(state["scaler_state_dict"])
+
+    # Migrate old ModuleList key names → new named-submodule key names
+    import re
+    def _migrate(k):
+        k = re.sub(r'encoder\.conv_blocks\.(\d+)', r'encoder.conv_\1', k)
+        k = re.sub(r'(mask_decoder|vec_decoder)\.upsamples\.(\d+)', r'\1.up_\2', k)
+        k = re.sub(r'(mask_decoder|vec_decoder)\.conv_blocks\.(\d+)', r'\1.conv_\2', k)
+        return k
+    migrated = any("conv_blocks" in k or "upsamples" in k for k in sd)
+    if migrated:
+        sd = {_migrate(k): v for k, v in sd.items()}
+        print("[train] Migrated checkpoint keys from old ModuleList names")
+
+    model.load_state_dict(sd)
+    if not migrated:
+        try:
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            if "scaler_state_dict" in state:
+                scaler.load_state_dict(state["scaler_state_dict"])
+        except (RuntimeError, ValueError) as e:
+            print(f"[train] WARNING: optimizer state incompatible ({e}); "
+                  f"resuming with fresh optimizer (weights are preserved)")
+    else:
+        print("[train] Skipping optimizer state (old ModuleList checkpoint — moments reset, weights kept)")
     if "scheduler_state_dict" in state and scheduler is not None:
         scheduler.load_state_dict(state["scheduler_state_dict"])
     return state["iteration"]
@@ -324,7 +376,7 @@ def train(params_path: str) -> None:
         model.parameters(),
         lr=params["learning_rate"],
         betas=(0.95, 0.999),
-        eps=1e-8,
+        eps=1e-7,
     )
 
     # ---- scheduler — fixed warmup + cosine decay (no total_steps dependency) -----
@@ -347,6 +399,7 @@ def train(params_path: str) -> None:
     use_amp = params.get("use_amp", True) and device.type == "cuda"
     scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+
     # ---- names / dirs -----------------------------------------------------
     model_name   = params.get("model_name",   "model")
     snapshot_dir = params.get("snapshot_dir", "snapshots")
@@ -357,6 +410,8 @@ def train(params_path: str) -> None:
     )
 
     # ---- dataset & loader -------------------------------------------------
+    # Scale epoch length with total training budget: ~1% of max_iter per epoch,
+    # clamped to [1000, 10000] so short and long runs both get reasonable epoch sizes.
     samples_per_epoch = max(1000, min(10_000, max_iter // 100))
 
     dataset = build_dataset(params, samples_per_epoch=samples_per_epoch)
@@ -384,8 +439,8 @@ def train(params_path: str) -> None:
     comb_type   = params.get("loss_comb_type", "sum")
     focal_gamma = float(params.get("focal_gamma", 2.0))
     # Optional gamma schedule: ramp to a new gamma value at a given iteration.
-    # Config: "focal_gamma_schedule": {"step": 425000, "gamma": 1.0}
-    _gamma_schedule = params.get("focal_gamma_schedule", None)
+    # Config: "focalgamma_schedule": {"step": 425000, "gamma": 1.0}
+    gamma_schedule = params.get("focalgamma_schedule", None)
     _cw = params.get("vec_channel_weights", [1.0, 1.0, 1.0])
     channel_weights = torch.tensor(_cw, dtype=torch.float32).to(device)
     normalize_by_magnitude = bool(params.get("vec_normalize_by_magnitude", False))
@@ -394,6 +449,18 @@ def train(params_path: str) -> None:
         pos_weight = float(pos_weight)
     balance       = bool(params.get("balance_labels", False))
     balance_scale = float(params.get("balance_scale", 1.0))
+
+    # synful-style center-crop supervision: supervise only output_size region
+    # disabled by default (full model output supervised); enable with "supervise_output_size": true
+    supervise_output_size = None
+    if params.get("supervise_output_size", False):
+        _out = params.get("output_size", None)
+        if _out is None:
+            raise ValueError("supervise_output_size requires 'output_size' in params")
+        supervise_output_size = tuple(int(x) for x in _out)
+        print(f"[train] supervise_output_size={supervise_output_size} (synful-style center crop)")
+    else:
+        print(f"[train] supervise_output_size=disabled (full model output supervised)")
 
     # ---- tensorboard ------------------------------------------------------
     tb_dir = params.get("tensorboard_dir", "tensorboard")
@@ -414,11 +481,10 @@ def train(params_path: str) -> None:
         del _dummy, _graph_model
         print("[train] Model graph written to TensorBoard.")
     except Exception as _e:
-        print(f"[train] WARNING: add_graph failed ({_e}) — skipping graph.")
+        pass  # TensorBoard tracing is flaky with grad_checkpoint; skip silently
 
     # ---- tensorboard: custom scalars layout --------------------------------
     # Groups scalars into named panels in the TensorBoard UI.
-    from torch.utils.tensorboard.summary import custom_scalar_layout
     layout = {
         "Loss": {
             "total + smoothed":  ["Multiline", ["loss/total", "loss/total_ema"]],
@@ -445,14 +511,14 @@ def train(params_path: str) -> None:
 
     # ---- tensorboard: hyperparameters -------------------------------------
     # Flatten the params dict to scalar hparams TensorBoard can display.
-    _hparam_keys = [
+    hparam_keys = [
         "learning_rate", "batch_size", "fmap_num", "fmap_inc_factor",
         "m_loss_scale", "d_loss_scale", "focal_gamma", "balance_labels",
         "balance_scale", "mask_pos_weight", "warmup_steps", "cosine_period",
         "final_div_factor", "grad_clip", "use_amp", "gpu_elastic",
         "num_data_workers", "kernel_size", "norm_type",
     ]
-    hparams = {k: params[k] for k in _hparam_keys if k in params}
+    hparams = {k: params[k] for k in hparam_keys if k in params}
     # Booleans must be cast to int for TensorBoard hparam display
     hparams = {k: (int(v) if isinstance(v, bool) else v)
                for k, v in hparams.items() if isinstance(v, (int, float, str, bool))}
@@ -464,11 +530,11 @@ def train(params_path: str) -> None:
     data_iter = iter(loader)
 
     # Apply gamma schedule immediately if resuming past the scheduled step.
-    _gamma_applied = False
-    if _gamma_schedule and iteration >= _gamma_schedule["step"]:
-        focal_gamma = float(_gamma_schedule["gamma"])
-        _gamma_applied = True
-        print(f"[train] focal_gamma → {focal_gamma} (schedule already passed at iter {_gamma_schedule['step']})")
+    gamma_applied = False
+    if gamma_schedule and iteration >= gamma_schedule["step"]:
+        focal_gamma = float(gamma_schedule["gamma"])
+        gamma_applied = True
+        print(f"[train] focal_gamma → {focal_gamma} (schedule already passed at iter {gamma_schedule['step']})")
 
     print(f"[train] Starting from iteration {iteration} / {max_iter}")
     if balance:
@@ -476,11 +542,10 @@ def train(params_path: str) -> None:
     else:
         print(f"[train] balance_labels=False  pos_weight={pos_weight}")
 
-    import time as _time
-    _loss_ema   = None          # exponential moving average of total loss
-    _ema_alpha  = 0.98          # smoothing factor (higher = smoother)
-    _t_last     = _time.perf_counter()
-    _iters_since_log = 0
+    loss_ema         = None   # exponential moving average of total loss
+    ema_alpha        = 0.98   # smoothing factor (higher = smoother)
+    t_last           = time.perf_counter()
+    iters_since_log  = 0
 
     grad_clip = params.get("grad_clip", 1.0)
 
@@ -508,77 +573,90 @@ def train(params_path: str) -> None:
                 )
 
         # Apply gamma schedule if configured (fires exactly once at the step boundary)
-        if _gamma_schedule and not _gamma_applied and iteration >= _gamma_schedule["step"]:
-            focal_gamma = float(_gamma_schedule["gamma"])
-            _gamma_applied = True
+        if gamma_schedule and not gamma_applied and iteration >= gamma_schedule["step"]:
+            focal_gamma = float(gamma_schedule["gamma"])
+            gamma_applied = True
             print(f"[train] focal_gamma → {focal_gamma} at iteration {iteration}")
             writer.add_scalar("focal_gamma", focal_gamma, iteration)
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            pred_mask, pred_vec = model(raw)
-            loss, m_loss, d_loss = combined_loss(
-                pred_mask, pred_vec, t_mask, t_vec, d_weight,
-                m_scale, d_scale, comb_type, focal_gamma, channel_weights,
-                normalize_by_magnitude, pos_weight,
-                balance, balance_scale,
-            )
+        try:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                pred_mask, pred_vec = model(raw)
+                loss, m_loss, d_loss = combined_loss(
+                    pred_mask, pred_vec, t_mask, t_vec, d_weight,
+                    m_scale, d_scale, comb_type, focal_gamma, channel_weights,
+                    normalize_by_magnitude, pos_weight,
+                    balance, balance_scale,
+                    output_size=supervise_output_size,
+                )
+        except torch.OutOfMemoryError:
+            print(f"[train] WARNING: OOM at iter {iteration} — freeing cache and skipping batch")
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            iteration += 1
+            iters_since_log += 1
+            continue
 
         loss_val = loss.item()
         if not math.isfinite(loss_val):
             print(f"[train] WARNING: non-finite loss={loss_val:.4g} at iter {iteration} "
                   f"(mask={m_loss.item():.4g} vec={d_loss.item():.4g}) — skipping batch")
+            print(f"[train]   pred_mask: min={pred_mask.min().item():.3g} max={pred_mask.max().item():.3g} "
+                  f"nan={pred_mask.isnan().any().item()} inf={pred_mask.isinf().any().item()}")
+            print(f"[train]   raw: min={raw.min().item():.3g} max={raw.max().item():.3g} "
+                  f"nan={raw.isnan().any().item()}")
+            print(f"[train]   t_mask: min={t_mask.min().item():.3g} max={t_mask.max().item():.3g} "
+                  f"nan={t_mask.isnan().any().item()}")
             optimizer.zero_grad(set_to_none=True)
-            # scaler.update() must always be called so the scale factor can decrease
-            # after a nan/inf, preventing repeated skips at the same inflated scale.
-            scaler.update()
+            del loss, m_loss, d_loss, pred_mask, pred_vec
+            torch.cuda.empty_cache()
             iteration += 1
-            _iters_since_log += 1
+            iters_since_log += 1
             continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
 
-        # compute grad norm before clipping (what we'd have clipped from)
-        raw_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        # Capture grad norm before clipping so we can log the unclipped value.
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
 
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
 
         iteration += 1
-        _iters_since_log += 1
+        iters_since_log += 1
 
-        # update EMA
-        if _loss_ema is None:
-            _loss_ema = loss_val
+        if loss_ema is None:
+            loss_ema = loss_val
         else:
-            _loss_ema = _ema_alpha * _loss_ema + (1.0 - _ema_alpha) * loss_val
+            loss_ema = ema_alpha * loss_ema + (1.0 - ema_alpha) * loss_val
 
         if iteration % log_every == 0:
             l, ml, dl = loss_val, m_loss.item(), d_loss.item()
             lr = scheduler.get_last_lr()[0]
 
-            _t_now   = _time.perf_counter()
-            elapsed  = max(_t_now - _t_last, 1e-6)
-            it_per_s = _iters_since_log / elapsed
-            _t_last  = _t_now
-            _iters_since_log = 0
+            t_now    = time.perf_counter()
+            elapsed  = max(t_now - t_last, 1e-6)
+            it_per_s = iters_since_log / elapsed
+            t_last   = t_now
+            iters_since_log = 0
 
-            print(f"[{iteration:>8}/{max_iter}]  loss={l:.5f}  ema={_loss_ema:.5f}  "
+            print(f"[{iteration:>8}/{max_iter}]  loss={l:.5f}  ema={loss_ema:.5f}  "
                   f"mask={ml:.5f}  vec={dl:.5f}  lr={lr:.2e}  "
-                  f"gnorm={raw_grad_norm:.3f}  {it_per_s:.1f}it/s")
+                  f"gnorm={grad_norm:.3f}  {it_per_s:.1f}it/s")
 
             # ---- scalar logging ----
-            writer.add_scalar("loss/total",        l,           iteration)
-            writer.add_scalar("loss/total_ema",    _loss_ema,   iteration)
-            writer.add_scalar("loss/mask",         ml,          iteration)
-            writer.add_scalar("loss/direction",    dl,          iteration)
-            writer.add_scalar("lr",                lr,          iteration)
-            writer.add_scalar("grad/global_norm",  float(raw_grad_norm), iteration)
-            writer.add_scalar("amp/scale",         scaler.get_scale(),   iteration)
-            writer.add_scalar("perf/iter_per_sec", it_per_s,    iteration)
+            writer.add_scalar("loss/total",        l,          iteration)
+            writer.add_scalar("loss/total_ema",    loss_ema,   iteration)
+            writer.add_scalar("loss/mask",         ml,         iteration)
+            writer.add_scalar("loss/direction",    dl,         iteration)
+            writer.add_scalar("lr",                lr,         iteration)
+            writer.add_scalar("grad/global_norm",  float(grad_norm),       iteration)
+            writer.add_scalar("amp/scale",         scaler.get_scale(),     iteration)
+            writer.add_scalar("perf/iter_per_sec", it_per_s,               iteration)
 
             # positive voxel fraction in GT mask (measures class imbalance)
             pos_frac = center_crop(t_mask, pred_mask.shape).float().mean().item()
@@ -592,9 +670,9 @@ def train(params_path: str) -> None:
                 writer.add_scalar("pred/vec_mag_x", pv[:, 2].abs().mean().item(), iteration)
 
         if iteration % hist_every == 0:
-            # ---- weight and gradient histograms ----
-            # Per named parameter: log weight distribution and grad distribution.
-            # Also track per-layer grad norms to spot vanishing/exploding layers.
+            # Log weight and gradient histograms per layer.
+            # max_layer_norm tracks the largest single-layer grad — useful for spotting
+            # exploding/vanishing gradients in specific parts of the network.
             max_layer_norm = 0.0
             for name, param in model.named_parameters():
                 if param.requires_grad:
@@ -603,21 +681,19 @@ def train(params_path: str) -> None:
                     if param.grad is not None:
                         g = param.grad.detach().float()
                         writer.add_histogram(f"grads/{safe}", g, iteration)
-                        layer_norm = g.norm().item()
-                        max_layer_norm = max(max_layer_norm, layer_norm)
+                        max_layer_norm = max(max_layer_norm, g.norm().item())
             writer.add_scalar("grad/max_layer_norm", max_layer_norm, iteration)
 
         if iteration % snapshot_every == 0:
             save_snapshot(batch, pred_mask, pred_vec, iteration, snapshot_dir)
             log_images(writer, batch, pred_mask, pred_vec, iteration)
 
-            # ---- PR curve (precision-recall) from this batch ----
+            # PR curve: precision-recall over this batch's predictions vs GT.
             with torch.no_grad():
-                _pm = center_crop(pred_mask, pred_mask.shape)  # already full size
-                _gt = center_crop(t_mask, pred_mask.shape)
-                _probs  = torch.sigmoid(_pm).float().cpu().flatten()
-                _labels = _gt.float().cpu().flatten().long()
-                writer.add_pr_curve("pr/indicator", _labels, _probs, iteration)
+                gt_cropped = center_crop(t_mask, pred_mask.shape)
+                probs  = torch.sigmoid(pred_mask).float().cpu().flatten()
+                labels = gt_cropped.float().cpu().flatten().long()
+                writer.add_pr_curve("pr/indicator", labels, probs, iteration)
 
         if iteration % save_every == 0:
             save_checkpoint(model, optimizer, scaler, scheduler, iteration, snapshot_dir, model_name)
@@ -626,15 +702,17 @@ def train(params_path: str) -> None:
 
     # ---- final hparams entry -----------------------------------------------
     # Links the run's hyperparameters to its final metrics in the HPARAMS tab.
-    writer.add_hparams(
-        hparams,
-        {
-            "hparam/final_loss":      loss_val,
-            "hparam/final_loss_ema":  _loss_ema if _loss_ema is not None else loss_val,
-            "hparam/final_mask_loss": m_loss.item(),
-            "hparam/final_vec_loss":  d_loss.item(),
-        },
-    )
+    # loss_val/m_loss/d_loss are only defined if at least one iteration ran.
+    if loss_ema is not None:
+        writer.add_hparams(
+            hparams,
+            {
+                "hparam/final_loss":      loss_val,
+                "hparam/final_loss_ema":  loss_ema,
+                "hparam/final_mask_loss": m_loss.item(),
+                "hparam/final_vec_loss":  d_loss.item(),
+            },
+        )
 
     writer.close()
     print("[train] Done.")

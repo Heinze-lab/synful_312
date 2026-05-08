@@ -32,6 +32,8 @@ from scipy.ndimage import (
     label as nd_label,
     find_objects,
 )
+from skimage.feature import peak_local_max
+from skimage.segmentation import watershed
 
 import daisy
 from funlib.geometry import Coordinate, Roi
@@ -68,6 +70,65 @@ def nms(detections: list[dict], radius: float) -> list[dict]:
 # Per-block extraction worker
 # ---------------------------------------------------------------------------
 
+def _split_mask_watershed(
+    mask: np.ndarray,
+    min_peak_dist: int,
+    min_sub_size: int,
+) -> list[np.ndarray]:
+    """
+    Given a binary mask, try to split it into sub-regions via EDT + watershed.
+    Returns a list of boolean sub-masks (one per synapse).
+    If no split is warranted (only one EDT peak found), returns [mask].
+    """
+    edt = distance_transform_edt(mask)
+    edt_max = edt.max()
+    if edt_max == 0:
+        return [mask]
+
+    # only seed from peaks that are at least 50% of the EDT maximum —
+    # this suppresses the many shallow local maxima on flat blob surfaces
+    peak_coords = peak_local_max(
+        edt,
+        min_distance=min_peak_dist,
+        threshold_abs=edt_max * 0.5,
+        exclude_border=False,
+    )
+    if len(peak_coords) <= 1:
+        return [mask]
+
+    # build seed markers — one unique label per peak
+    markers = np.zeros(mask.shape, dtype=np.int32)
+    for i, coord in enumerate(peak_coords, start=1):
+        markers[tuple(coord)] = i
+
+    # watershed on inverted EDT (fills from peaks outward)
+    ws = watershed(-edt, markers, mask=mask)
+
+    sub_masks = []
+    for lbl in range(1, len(peak_coords) + 1):
+        sub = ws == lbl
+        if sub.sum() >= min_sub_size:
+            sub_masks.append(sub)
+
+    # if filtering removed all regions somehow, fall back to unsplit
+    return sub_masks if sub_masks else [mask]
+
+
+def _sphere_mask(shape: tuple, center: np.ndarray, radius_vx: np.ndarray) -> np.ndarray:
+    """Boolean mask of an axis-aligned ellipsoid with per-axis radii."""
+    gz, gy, gx = np.ogrid[
+        0:shape[0],
+        0:shape[1],
+        0:shape[2],
+    ]
+    dist_sq = (
+        ((gz - center[0]) / radius_vx[0]) ** 2 +
+        ((gy - center[1]) / radius_vx[1]) ** 2 +
+        ((gx - center[2]) / radius_vx[2]) ** 2
+    )
+    return dist_sq <= 1.0
+
+
 def extract_block(
     block: daisy.Block,
     ind_ds,
@@ -85,6 +146,17 @@ def extract_block(
     zarr_offset: np.ndarray,
     read_offset_nm: np.ndarray,
     tmp_dir: str,
+    suppression_enabled: bool = False,
+    suppression_threshold: float = 0.9,
+    suppression_radius_vx: np.ndarray = None,
+    suppression_min_separation_vx: float = 5.0,
+    suppression_score_thr: float = None,
+    suppression_size_thr: int = None,
+    splitting_enabled: bool = False,
+    splitting_min_size_vx: int = 80,
+    splitting_min_elongation: float = 0.0,
+    splitting_min_peak_dist: int = 4,
+    splitting_min_sub_size: int = 8,
 ) -> None:
     """Run inside a daisy worker process. Writes per-block results to tmp_dir."""
 
@@ -145,6 +217,8 @@ def extract_block(
     read_origin_vx = np.array([s.start for s in read_sl])
 
     detections = []
+    # occupied_mask tracks all voxels claimed by accepted CCs (used by suppression guard A)
+    occupied_mask = np.zeros_like(binary)
 
     for lbl, bbox in enumerate(bboxes, start=1):
         if bbox is None:
@@ -166,27 +240,30 @@ def extract_block(
         if score < score_thr:
             continue
 
-        # location within the read crop
-        if loc_type == "centroid":
-            zz, yy, xx = np.where(mask_crop)
-            local_loc = np.array([zz.mean(), yy.mean(), xx.mean()])
-        elif loc_type == "edt":
-            edt = distance_transform_edt(mask_crop)
-            local_loc = np.array(np.unravel_index(edt.argmax(), edt.shape), dtype=float)
-        else:  # peak
-            masked = ind_sub * mask_crop
-            local_loc = np.array(np.unravel_index(masked.argmax(), masked.shape), dtype=float)
+        # ---- optional blob splitting ----------------------------------------
+        # Decide whether to attempt a watershed split on this CC.
+        attempt_split = (
+            splitting_enabled
+            and size >= splitting_min_size_vx
+        )
+        if attempt_split and splitting_min_elongation > 0.0:
+            # cheap elongation gate: major/minor axis ratio via inertia tensor
+            try:
+                from skimage.measure import regionprops
+                props = regionprops(mask_crop.astype(np.uint8))[0]
+                elongation = (props.axis_major_length / max(props.axis_minor_length, 1e-6))
+                attempt_split = elongation >= splitting_min_elongation
+            except Exception:
+                pass  # if regionprops fails for any reason, still attempt split
 
-        # position in the read crop coords
+        if attempt_split:
+            sub_masks = _split_mask_watershed(mask_crop, splitting_min_peak_dist, splitting_min_sub_size)
+        else:
+            sub_masks = [mask_crop]
+
         bbox_origin = np.array([s.start for s in bbox])
-        post_in_crop = local_loc + bbox_origin   # ZYX within read crop
 
-        # check centroid is inside the write (inner) roi
-        pos_in_write = post_in_crop - halo_vx
-        if np.any(pos_in_write < 0) or np.any(pos_in_write >= write_shape_vx):
-            continue
-
-        # lazy vector read: bbox in absolute zarr voxel coords
+        # lazy vector read once for the whole bbox (shared across sub-masks)
         abs_bbox = tuple(
             slice(int(s.start + read_origin_vx[i]), int(s.stop + read_origin_vx[i]))
             for i, s in enumerate(bbox)
@@ -194,36 +271,208 @@ def extract_block(
         vec_crop_raw = np.array(vec_ds[(slice(None),) + abs_bbox]).astype(np.float32)
         vec_crop_bb  = vec_crop_raw / vec_scale[:, None, None, None]
 
-        vz = float(vec_crop_bb[0][mask_crop].mean())
-        vy = float(vec_crop_bb[1][mask_crop].mean())
-        vx = float(vec_crop_bb[2][mask_crop].mean())
-        vec = np.array([vz, vy, vx])
+        for sub_mask in sub_masks:
+            sub_size = int(sub_mask.sum())
 
-        post_zyx = post_in_crop
-        pre_zyx  = post_zyx + vec
+            # re-score the sub-region
+            ind_sub_local = ind_sub  # same bbox
+            if score_type == "mean":
+                sub_score = float(ind_sub_local[sub_mask].mean())
+            else:
+                sub_score = float(ind_sub_local[sub_mask].max())
 
-        if post_offset_scale != 0.0:
-            post_zyx = post_zyx + vec * post_offset_scale
-        if pre_offset_scale != 0.0:
-            pre_zyx = pre_zyx + vec * pre_offset_scale
+            if sub_score < score_thr:
+                continue
 
-        # convert crop-local voxel coords → world nm
-        post_world = (post_zyx + read_origin_vx) * vs + world_origin_nm
-        pre_world  = (pre_zyx  + read_origin_vx) * vs + world_origin_nm
+            # location within bbox
+            if loc_type == "centroid":
+                zz, yy, xx = np.where(sub_mask)
+                local_loc = np.array([zz.mean(), yy.mean(), xx.mean()])
+            elif loc_type == "edt":
+                edt = distance_transform_edt(sub_mask)
+                local_loc = np.array(np.unravel_index(edt.argmax(), edt.shape), dtype=float)
+            else:  # peak
+                masked = ind_sub_local * sub_mask
+                local_loc = np.array(np.unravel_index(masked.argmax(), masked.shape), dtype=float)
 
-        if flipprepost:
-            post_world, pre_world = pre_world, post_world
+            post_in_crop = local_loc + bbox_origin
 
-        detections.append({
-            "post_z": float(post_world[0]),
-            "post_y": float(post_world[1]),
-            "post_x": float(post_world[2]),
-            "pre_z":  float(pre_world[0]),
-            "pre_y":  float(pre_world[1]),
-            "pre_x":  float(pre_world[2]),
-            "score":  score,
-            "size":   size,
-        })
+            # check centroid is inside write roi
+            pos_in_write = post_in_crop - halo_vx
+            if np.any(pos_in_write < 0) or np.any(pos_in_write >= write_shape_vx):
+                continue
+
+            vz = float(vec_crop_bb[0][sub_mask].mean())
+            vy = float(vec_crop_bb[1][sub_mask].mean())
+            vx = float(vec_crop_bb[2][sub_mask].mean())
+            vec = np.array([vz, vy, vx])
+
+            post_zyx = post_in_crop
+            pre_zyx  = post_zyx + vec
+
+            if post_offset_scale != 0.0:
+                post_zyx = post_zyx + vec * post_offset_scale
+            if pre_offset_scale != 0.0:
+                pre_zyx = pre_zyx + vec * pre_offset_scale
+
+            post_world = (post_zyx + read_origin_vx) * vs + world_origin_nm
+            pre_world  = (pre_zyx  + read_origin_vx) * vs + world_origin_nm
+
+            if flipprepost:
+                post_world, pre_world = pre_world, post_world
+
+            detections.append({
+                "post_z": float(post_world[0]),
+                "post_y": float(post_world[1]),
+                "post_x": float(post_world[2]),
+                "pre_z":  float(pre_world[0]),
+                "pre_y":  float(pre_world[1]),
+                "pre_x":  float(pre_world[2]),
+                "score":  sub_score,
+                "size":   sub_size,
+            })
+
+        # mark voxels occupied for suppression guard A
+        full_mask = labeled == lbl
+        occupied_mask |= full_mask
+
+    # ---- local confidence suppression pass ---------------------------------
+    if suppression_enabled and suppression_radius_vx is not None:
+        sup_score_thr = suppression_score_thr if suppression_score_thr is not None else score_thr
+        sup_size_thr  = suppression_size_thr  if suppression_size_thr  is not None else size_thr
+
+        # collect centroids (crop coords) of high-confidence initial detections
+        high_conf_centroids = []
+        for lbl, bbox in enumerate(bboxes, start=1):
+            if bbox is None:
+                continue
+            lab_crop  = labeled[bbox]
+            mask_crop = lab_crop == lbl
+            ind_sub   = ind_crop[bbox]
+            if score_type == "mean":
+                sc = float(ind_sub[mask_crop].mean())
+            else:
+                sc = float(ind_sub[mask_crop].max())
+            if sc >= suppression_threshold:
+                if loc_type == "centroid":
+                    zz, yy, xx = np.where(mask_crop)
+                    cen = np.array([zz.mean(), yy.mean(), xx.mean()])
+                elif loc_type == "edt":
+                    edt = distance_transform_edt(mask_crop)
+                    cen = np.array(np.unravel_index(edt.argmax(), edt.shape), dtype=float)
+                else:
+                    masked = ind_sub * mask_crop
+                    cen = np.array(np.unravel_index(masked.argmax(), masked.shape), dtype=float)
+                bbox_origin = np.array([s.start for s in bbox])
+                high_conf_centroids.append(cen + bbox_origin)
+
+        if high_conf_centroids:
+            # suppress a sphere around each high-conf centroid in a copy of ind_crop
+            ind_suppressed = ind_crop.copy()
+            for cen in high_conf_centroids:
+                smask = _sphere_mask(ind_suppressed.shape, cen, suppression_radius_vx)
+                ind_suppressed[smask] = 0.0
+
+            # re-threshold and re-label the suppressed volume
+            binary2  = ind_suppressed >= cc_threshold
+            # exclude voxels already occupied by initial CCs (guard A)
+            binary2 &= ~occupied_mask
+            if binary2.any():
+                labeled2, n2 = nd_label(binary2)
+                bboxes2 = find_objects(labeled2)
+                log.info(f"Block {block_id}: suppression found {n2} candidate CCs")
+
+                initial_post_pts = np.array([
+                    [(d["post_z"] - world_origin_nm[0]) / vs[0] - read_origin_vx[0],
+                     (d["post_y"] - world_origin_nm[1]) / vs[1] - read_origin_vx[1],
+                     (d["post_x"] - world_origin_nm[2]) / vs[2] - read_origin_vx[2]]
+                    for d in detections
+                ]) if detections else None
+
+                n_new = 0
+                for lbl2, bbox2 in enumerate(bboxes2, start=1):
+                    if bbox2 is None:
+                        continue
+
+                    lab_crop2  = labeled2[bbox2]
+                    mask_crop2 = lab_crop2 == lbl2
+
+                    size2 = int(mask_crop2.sum())
+                    if size2 < sup_size_thr:
+                        continue
+
+                    ind_sub2 = ind_suppressed[bbox2]
+                    if score_type == "mean":
+                        score2 = float(ind_sub2[mask_crop2].mean())
+                    else:
+                        score2 = float(ind_sub2[mask_crop2].max())
+
+                    if score2 < sup_score_thr:
+                        continue
+
+                    if loc_type == "centroid":
+                        zz, yy, xx = np.where(mask_crop2)
+                        local_loc2 = np.array([zz.mean(), yy.mean(), xx.mean()])
+                    elif loc_type == "edt":
+                        edt2 = distance_transform_edt(mask_crop2)
+                        local_loc2 = np.array(np.unravel_index(edt2.argmax(), edt2.shape), dtype=float)
+                    else:
+                        masked2 = ind_sub2 * mask_crop2
+                        local_loc2 = np.array(np.unravel_index(masked2.argmax(), masked2.shape), dtype=float)
+
+                    bbox_origin2 = np.array([s.start for s in bbox2])
+                    post_in_crop2 = local_loc2 + bbox_origin2
+
+                    # check centroid inside write roi
+                    pos_in_write2 = post_in_crop2 - halo_vx
+                    if np.any(pos_in_write2 < 0) or np.any(pos_in_write2 >= write_shape_vx):
+                        continue
+
+                    # guard B: centroid distance from all initial detections
+                    if initial_post_pts is not None:
+                        dists = np.linalg.norm(initial_post_pts - post_in_crop2, axis=1)
+                        if dists.min() < suppression_min_separation_vx:
+                            continue
+
+                    abs_bbox2 = tuple(
+                        slice(int(s.start + read_origin_vx[i]), int(s.stop + read_origin_vx[i]))
+                        for i, s in enumerate(bbox2)
+                    )
+                    vec_crop_raw2 = np.array(vec_ds[(slice(None),) + abs_bbox2]).astype(np.float32)
+                    vec_crop_bb2  = vec_crop_raw2 / vec_scale[:, None, None, None]
+
+                    vz2 = float(vec_crop_bb2[0][mask_crop2].mean())
+                    vy2 = float(vec_crop_bb2[1][mask_crop2].mean())
+                    vx2 = float(vec_crop_bb2[2][mask_crop2].mean())
+                    vec2 = np.array([vz2, vy2, vx2])
+
+                    post_zyx2 = post_in_crop2
+                    pre_zyx2  = post_zyx2 + vec2
+
+                    if post_offset_scale != 0.0:
+                        post_zyx2 = post_zyx2 + vec2 * post_offset_scale
+                    if pre_offset_scale != 0.0:
+                        pre_zyx2 = pre_zyx2 + vec2 * pre_offset_scale
+
+                    post_world2 = (post_zyx2 + read_origin_vx) * vs + world_origin_nm
+                    pre_world2  = (pre_zyx2  + read_origin_vx) * vs + world_origin_nm
+
+                    if flipprepost:
+                        post_world2, pre_world2 = pre_world2, post_world2
+
+                    detections.append({
+                        "post_z": float(post_world2[0]),
+                        "post_y": float(post_world2[1]),
+                        "post_x": float(post_world2[2]),
+                        "pre_z":  float(pre_world2[0]),
+                        "pre_y":  float(pre_world2[1]),
+                        "pre_x":  float(pre_world2[2]),
+                        "score":  score2,
+                        "size":   size2,
+                    })
+                    n_new += 1
+
+                log.info(f"Block {block_id}: suppression added {n_new} new detections")
 
     log.info(f"Block {block_id}: {len(detections)} detections")
     _write_block_result(tmp_dir, block_id, detections)
@@ -262,9 +511,45 @@ def extract(params_path: str) -> None:
     context_zyx    = list(cfg.get("context_zyx",    [20,  40,  40]))
     num_workers    = int(cfg.get("num_workers",     4))
 
+    # ---- suppression parameters --------------------------------------------
+    sup_cfg = cfg.get("suppression", {})
+    suppression_enabled   = bool(sup_cfg.get("enabled",            False))
+    suppression_threshold = float(sup_cfg.get("threshold",          0.9))
+    suppression_radius_vx = np.array(
+        sup_cfg.get("radius_vx", [3, 8, 8]), dtype=float
+    )
+    suppression_min_sep   = float(sup_cfg.get("min_separation_vx",  5.0))
+    # optional overrides for score/size thresholds in the suppression pass
+    _sup_score_raw = sup_cfg.get("score_thr",  None)
+    _sup_size_raw  = sup_cfg.get("size_thr",   None)
+    suppression_score_thr = float(_sup_score_raw) if _sup_score_raw is not None else None
+    suppression_size_thr  = int(_sup_size_raw)     if _sup_size_raw  is not None else None
+
+    # ---- splitting parameters ----------------------------------------------
+    spl_cfg = cfg.get("blob_splitting", {})
+    splitting_enabled      = bool(spl_cfg.get("enabled",           False))
+    splitting_min_size_vx  = int(spl_cfg.get("min_size_vx",        80))
+    splitting_min_elong    = float(spl_cfg.get("elongation_thr",   0.0))
+    splitting_min_peak_dist= int(spl_cfg.get("min_peak_distance_vx", 4))
+    splitting_min_sub_size = int(spl_cfg.get("min_sub_size_vx",    8))
+
     log.info(f"cc_threshold={cc_threshold}  loc_type={loc_type}")
     log.info(f"score_thr={score_thr}  size_thr={size_thr}  nms_radius={nms_radius}")
     log.info(f"block_size_zyx={block_size_zyx}  context_zyx={context_zyx}  num_workers={num_workers}")
+    if splitting_enabled:
+        log.info(
+            f"Blob splitting: min_size_vx={splitting_min_size_vx}  "
+            f"elongation_thr={splitting_min_elong}  "
+            f"min_peak_distance_vx={splitting_min_peak_dist}  "
+            f"min_sub_size_vx={splitting_min_sub_size}"
+        )
+    if suppression_enabled:
+        log.info(
+            f"Suppression: threshold={suppression_threshold}  "
+            f"radius_vx={suppression_radius_vx.tolist()}  "
+            f"min_separation_vx={suppression_min_sep}  "
+            f"score_thr={suppression_score_thr}  size_thr={suppression_size_thr}"
+        )
 
     # ---- open prediction zarr ----------------------------------------------
     inf_path = os.path.join(cfg.get("inference_dir", "."), cfg.get("inference_file", "pred.zarr"))
@@ -301,6 +586,8 @@ def extract(params_path: str) -> None:
     read_offset = np.array(
         params.get("predict", {}).get("read_offset", [0, 0, 0]), dtype=float
     )
+    # -1 is used as a sentinel meaning "start of volume" in predict.py; clamp here too.
+    read_offset = np.where(read_offset < 0, 0.0, read_offset)
     read_offset_nm = read_offset * voxel_size
 
     # ---- build daisy ROIs --------------------------------------------------
@@ -348,6 +635,17 @@ def extract(params_path: str) -> None:
             zarr_offset,
             read_offset_nm,
             tmp_dir,
+            suppression_enabled=suppression_enabled,
+            suppression_threshold=suppression_threshold,
+            suppression_radius_vx=suppression_radius_vx,
+            suppression_min_separation_vx=suppression_min_sep,
+            suppression_score_thr=suppression_score_thr,
+            suppression_size_thr=suppression_size_thr,
+            splitting_enabled=splitting_enabled,
+            splitting_min_size_vx=splitting_min_size_vx,
+            splitting_min_elongation=splitting_min_elong,
+            splitting_min_peak_dist=splitting_min_peak_dist,
+            splitting_min_sub_size=splitting_min_sub_size,
         ),
         num_workers=num_workers,
         fit="shrink",

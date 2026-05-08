@@ -128,7 +128,7 @@ def extract(params_path: str) -> None:
     indicators = store["pred_syn_indicators"][:].astype(np.float32) / 255.0
     _vec_raw  = store["pred_partner_vectors"][:].astype(np.float32)   # (3,Z,Y,X) int8-scaled
     _vec_scale = np.array(cfg.get("vector_scale", [1, 1, 1]), dtype=np.float32)[:, None, None, None]
-    vectors   = _vec_raw / _vec_scale
+    vectors   = _vec_raw * _vec_scale
 
     print(f"[extract] Indicator shape: {indicators.shape}  "
           f"range=[{indicators.min():.3f},{indicators.max():.3f}]")

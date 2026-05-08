@@ -111,50 +111,97 @@ def render_direction_vectors(shape, post_locs, pre_locs, d_blob_radius, voxel_si
         (yy / (ry + 0.5))**2 +
         (xx / (rx + 0.5))**2
     )
-    se      = norm_dist <= 1.0
-    # linear taper: 1 at blob centre, 0 at the ellipsoid boundary
-    falloff = np.where(se, 1.0 - norm_dist, 0.0).astype(np.float32)
+    se = norm_dist <= 1.0
 
     vox = np.array(voxel_size, dtype=np.float32)
-    # per-voxel offsets within the blob kernel (ZYX, scaled by voxel_size)
-    blob_offsets = np.stack([zz, yy, xx], axis=0).astype(np.float32) * vox[:, None, None, None]  # (3, 2rz+1, 2ry+1, 2rx+1)
+
+    canvas_shape = vectors.shape[1:]
+
+    # Pass 1: collect per-synapse blobs and accumulate an overlap count map,
+    # matching synful's AddPartnerVectorMap logic exactly.
+    blob_masks  = []   # list of (z0,y0,x0, bool_slice) per synapse
+    union_count = np.zeros(shape, dtype=np.int32)
 
     for post, pre in zip(post_locs, pre_locs):
         post_r = np.round(post).astype(int)
-        shape  = vectors.shape[1:]
 
-        # bounding box of blob in canvas
-        z0 = max(0, post_r[0]-rz); z1 = min(shape[0], post_r[0]+rz+1)
-        y0 = max(0, post_r[1]-ry); y1 = min(shape[1], post_r[1]+ry+1)
-        x0 = max(0, post_r[2]-rx); x1 = min(shape[2], post_r[2]+rx+1)
+        z0 = max(0, post_r[0]-rz); z1 = min(canvas_shape[0], post_r[0]+rz+1)
+        y0 = max(0, post_r[1]-ry); y1 = min(canvas_shape[1], post_r[1]+ry+1)
+        x0 = max(0, post_r[2]-rx); x1 = min(canvas_shape[2], post_r[2]+rx+1)
         if z1 <= z0 or y1 <= y0 or x1 <= x0:
+            blob_masks.append(None)
             continue
 
-        # corresponding slice of blob kernel
         se_z0 = rz-(post_r[0]-z0); se_z1 = se_z0+(z1-z0)
         se_y0 = ry-(post_r[1]-y0); se_y1 = se_y0+(y1-y0)
         se_x0 = rx-(post_r[2]-x0); se_x1 = se_x0+(x1-x0)
 
-        blob_sl = se[se_z0:se_z1, se_y0:se_y1, se_x0:se_x1]  # (dz, dy, dx)
-        off_sl  = blob_offsets[:, se_z0:se_z1, se_y0:se_y1, se_x0:se_x1]  # (3, dz, dy, dx)
+        blob_sl = se[se_z0:se_z1, se_y0:se_y1, se_x0:se_x1].copy()
+        union_count[z0:z1, y0:y1, x0:x1] += blob_sl.astype(np.int32)
+        blob_masks.append((z0, y0, x0, blob_sl))
 
-        # absolute position of each voxel in canvas coords
+    # Pass 2: remove overlap voxels from all blobs, then reassign them to the
+    # nearest post-synaptic centre (KDTree), matching synful's logic.
+    overlap_voxels = np.argwhere(union_count > 1)  # (N, 3) canvas coords
+
+    if len(overlap_voxels) and len(post_locs) > 1:
+        post_world = np.array([
+            np.round(p).astype(int) * vox for p in post_locs
+        ], dtype=np.float32)   # (M, 3) world coords of each post centre
+
+        from scipy.spatial import KDTree
+        kd = KDTree(post_world)
+        overlap_world = overlap_voxels.astype(np.float32) * vox  # (N, 3)
+        _, nearest_idx = kd.query(overlap_world)
+
+        for bm in blob_masks:
+            if bm is None:
+                continue
+            z0, y0, x0, bsl = bm
+            dz, dy, dx = bsl.shape
+            # zero out overlap region in this blob
+            local_ovlp = overlap_voxels[
+                (overlap_voxels[:,0] >= z0) & (overlap_voxels[:,0] < z0+dz) &
+                (overlap_voxels[:,1] >= y0) & (overlap_voxels[:,1] < y0+dy) &
+                (overlap_voxels[:,2] >= x0) & (overlap_voxels[:,2] < x0+dx)
+            ]
+            for v in local_ovlp:
+                bsl[v[0]-z0, v[1]-y0, v[2]-x0] = False
+
+        # reassign each overlap voxel to its nearest post centre
+        for ov, nidx in zip(overlap_voxels, nearest_idx):
+            bm = blob_masks[nidx]
+            if bm is None:
+                continue
+            z0, y0, x0, bsl = bm
+            lz, ly, lx = ov[0]-z0, ov[1]-y0, ov[2]-x0
+            if 0 <= lz < bsl.shape[0] and 0 <= ly < bsl.shape[1] and 0 <= lx < bsl.shape[2]:
+                bsl[lz, ly, lx] = True
+
+    # Pass 3: write vectors and weight mask using the corrected blobs.
+    for i, (post, pre) in enumerate(zip(post_locs, pre_locs)):
+        bm = blob_masks[i]
+        if bm is None:
+            continue
+        z0, y0, x0, blob_sl = bm
+        z1, y1, x1 = z0+blob_sl.shape[0], y0+blob_sl.shape[1], x0+blob_sl.shape[2]
+
         vox_pos_z = np.arange(z0, z1, dtype=np.float32) * vox[0]
         vox_pos_y = np.arange(y0, y1, dtype=np.float32) * vox[1]
         vox_pos_x = np.arange(x0, x1, dtype=np.float32) * vox[2]
-        vox_world = np.stack(np.meshgrid(vox_pos_z, vox_pos_y, vox_pos_x, indexing='ij'), axis=0)  # (3, dz, dy, dx)
+        vox_world = np.stack(np.meshgrid(vox_pos_z, vox_pos_y, vox_pos_x, indexing='ij'), axis=0)
 
-        pre_world  = pre.astype(np.float32) * vox
-        # per-voxel vector: from this voxel to pre
-        per_voxel_vec = pre_world[:, None, None, None] - vox_world  # (3, dz, dy, dx)
+        pre_world     = pre.astype(np.float32) * vox
+        per_voxel_vec = pre_world[:, None, None, None] - vox_world
 
-        # write only inside blob, don't overwrite with zeros outside
-        mask3 = blob_sl[None]  # (1, dz, dy, dx)
-        existing = vectors[:, z0:z1, y0:y1, x0:x1]
-        vectors[:, z0:z1, y0:y1, x0:x1] = np.where(mask3, per_voxel_vec, existing)
+        mask3 = blob_sl[None]
+        vectors[:, z0:z1, y0:y1, x0:x1] = np.where(
+            mask3, per_voxel_vec, vectors[:, z0:z1, y0:y1, x0:x1]
+        )
         weight_mask[z0:z1, y0:y1, x0:x1] = np.maximum(
             weight_mask[z0:z1, y0:y1, x0:x1], blob_sl.astype(np.float32)
         )
+
     return vectors, weight_mask
 
 
@@ -213,7 +260,7 @@ def _roi_from_zarr(zarr_path: str, raw_key: str = "RAW") -> Roi:
 
 
 def resolve_rois(zarr_locs: List[str], params: dict) -> List[Optional[Roi]]:
-    """Always use the full zarr extent as the ROI (voxel_size = [1,1,1])."""
+    """Return the full spatial extent of each zarr as its ROI."""
     rois = []
     for z in zarr_locs:
         try:
@@ -347,6 +394,7 @@ class SynfulDataset(Dataset):
         self.raw_dataset       = raw_dataset
 
         self.input_size    = np.array(params["input_size"], dtype=int)
+        self.output_size   = np.array(params.get("output_size", params["input_size"]), dtype=int)
         self.blob_radius   = list(params["blob_radius"])
         self.d_blob_radius = list(params["d_blob_radius"])
         self.voxel_size    = list(params.get("voxel_size", [1, 1, 1]))
@@ -471,10 +519,18 @@ class SynfulDataset(Dataset):
                 post_locs = post_local[in_bounds]
                 pre_locs  = pre_local[in_bounds]
 
-        # rejection sampling — check against the inner (non-context) region
-        inner_sl   = tuple(slice(int(ctx[i]), int(ctx[i] + self.input_size[i])) for i in range(3))
-        inner_post = post_locs[
-            np.all((post_locs >= ctx) & (post_locs < ctx + self.input_size), axis=1)
+        # rejection sampling — check against the output region, not the full
+        # input region. input_size includes elastic context; output_size is what
+        # the model actually supervises. Using input_size here caused synapses
+        # near output edges to be systematically underrepresented during training
+        # because a synapse centre had to land well inside the larger input crop
+        # to count, making edge-of-output positions rarely seen.
+        inner_sl    = tuple(slice(int(ctx[i]), int(ctx[i] + self.input_size[i])) for i in range(3))
+        out_margin  = (self.input_size - self.output_size) // 2
+        out_lo      = ctx + out_margin
+        out_hi      = out_lo + self.output_size
+        inner_post  = post_locs[
+            np.all((post_locs >= out_lo) & (post_locs < out_hi), axis=1)
         ] if len(post_locs) else post_locs
         p_req = self.p_nonempty if sample.has_synapses else 0.0
         if len(inner_post) == 0 and np.random.random() < p_req:
